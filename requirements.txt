@@ -1,0 +1,27 @@
+# VYOM — Python dependencies
+# Install: pip install -r requirements.txt
+# Python 3.10+ required
+
+# ── Deep Learning ─────────────────────────────────────────────────────────────
+torch>=2.0.0
+torchvision>=0.15.0          # needed by some torch utilities
+
+# ── Astronomy ─────────────────────────────────────────────────────────────────
+lightkurve>=2.4.0            # TESS/Kepler data download and handling
+astropy>=5.3                 # FITS file reading, time conversion
+wotan>=1.10                  # light curve detrending (biweight, cosine)
+transitleastsquares>=1.0.31  # TLS transit detection algorithm
+batman-package>=2.4.9        # transit model for injection-recovery tests
+
+# ── Scientific Python ─────────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+plotly>=5.14.0
+streamlit>=1.28.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.65.0                 # progress bars in training loops
