@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pth
+data/
+weights/
+.env
+venv/
+*.fits
