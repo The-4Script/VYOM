@@ -70,17 +70,6 @@ vyom/
 └── README.md
 ```
 
----
-
-## Setup *(coming soon)*
-
-This section describes the planned setup — code and training pipeline are not yet implemented.
-
-```bash
-pip install -r requirements.txt
-python scripts/download_data.py
-```
-
 ## Team
 
 - [Durvesh Thorat](https://www.linkedin.com/in/durvesh-thorat)
