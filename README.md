@@ -70,41 +70,16 @@ vyom/
 └── README.md
 ```
 
----
-
-## Setup *(coming soon)*
-
-This section describes the planned setup — code and training pipeline are not yet implemented.
-
-```bash
-pip install -r requirements.txt
-python scripts/download_data.py
-```
-
----
-
-## Usage *(coming soon)*
-
-Planned quick-start sequence, not yet functional:
-
-```bash
-python -m denoiser.train
-python -m classifier.train
-streamlit run dashboard/app.py
-```
-
----
-
 ## Team
 
-- [Kaustubh Bhoir](https://www.linkedin.com/in/kaustubh-bhoir-ce/)
-- [Durvesh Thorat](https://www.linkedin.com/in/durvesh-thorat/)
-- [Nipun Tamore](https://www.linkedin.com/in/nipun-tamore-21ba5b308/)
-- [Arnav Patil](https://www.linkedin.com/in/arnav-pradip-patil-3b872b358/)
+- [Durvesh Thorat](https://www.linkedin.com/in/durvesh-thorat)
+- [Kaustubh Bhoir](https://www.linkedin.com/in/kaustubh-bhoir-ce)
+- [Nipun Tamore](https://www.linkedin.com/in/nipun-tamore-21ba5b308)
+- [Arnav Patil](https://www.linkedin.com/in/arnav-pradip-patil-3b872b358)
 
 ---
 
 ## Acknowledgments
 
-Built for ISRO Hackathon 2025 (PS7), in partnership with Hack2Skill.
+Built for ISRO Hackathon 2026 (PS7), in partnership with Hack2Skill.
 Uses public TESS and Kepler mission data, TOI and KOI catalogs.
