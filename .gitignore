@@ -1,8 +1,44 @@
-__pycache__/
-*.pyc
-*.pth
+# ── Data & weights — too large for git ───────────────────────────────────────
 data/
 weights/
-.env
-venv/
+
+# ── FITS files — can be 1GB+ each ────────────────────────────────────────────
 *.fits
+*.fit
+
+# ── Trained model files ───────────────────────────────────────────────────────
+*.pth
+*.pt
+*.ckpt
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+
+# ── Jupyter notebooks checkpoints ────────────────────────────────────────────
+notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.local
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── Temp test scripts (do not commit) ────────────────────────────────────────
+test_*_quick.py
