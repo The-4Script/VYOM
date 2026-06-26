@@ -452,7 +452,11 @@ def train(
 
     # ── Load best weights before returning ────────────────────────────────
     if CFG.best_weights.exists():
-        ckpt = torch.load(CFG.best_weights, map_location=device)
+        ckpt = torch.load(
+            CFG.best_weights,
+            map_location=device,
+            weights_only=False,
+        )
         model.load_state_dict(ckpt["model_state"])
         logger.info(f"Best weights loaded from {CFG.best_weights}")
 
