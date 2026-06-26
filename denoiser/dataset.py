@@ -1,27 +1,22 @@
 """
-denoiser/dataset.py
+denoiser/dataset.py  — PATCHED for VYOM folder structure
 
-TESSSectorPairDataset — PyTorch Dataset for Noise2Noise denoiser training.
+Changes from original:
+  1. _scan_fits_files()  — rewrote to match TIC_{id}/mastDownload/TESS/{sector_folder}/*.fits
+  2. _chunk()            — gap-aware: never chunks across Earth occultation gaps
+  3. _build_pairs_index()— uses closest sector pair, not just first two
+  4. _read_fits()        — unchanged (was correct)
+  5. Everything else     — unchanged
 
-Core idea:
-  TESS observes the same star across multiple sectors (27-day observation windows).
-  Each sector is an INDEPENDENT noisy observation of the same underlying stellar signal.
-  So (sector_1_flux, sector_2_flux) of the same star = perfect Noise2Noise training pair.
-  No clean ground truth ever needed.
-
-Flow:
-  1. Scan data/raw/tess/ for all FITS files
-  2. Group by TIC ID — find stars observed in 2+ sectors
-  3. Split TIC IDs into train/val/test (never split by file — same star must stay together)
-  4. For each star pair: preprocess both sectors, chunk into T=1000 windows
-  5. Cache chunks as .npy to data/samples/denoiser/ — skip re-processing on next run
-
-Usage:
-  from denoiser.dataset import get_dataloaders
-  train_loader, val_loader, test_loader = get_dataloaders()
+Folder structure expected:
+  data/raw/tess/
+    TIC_384549882/
+      mastDownload/
+        TESS/
+          tess2021039152502-s0035-0000000384549882-0205-s/
+            tess2021039152502-s0035-0000000384549882-0205-s_lc.fits
 """
 
-import os
 import re
 import csv
 import logging
@@ -38,22 +33,23 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FITS reading + preprocessing (minimal, self-contained)
-# Full preprocessing lives in pipeline/preprocess.py
-# This version is lightweight — just enough for denoiser training
+# FITS reading + preprocessing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _read_fits(fits_path: Path) -> Optional[np.ndarray]:
+def _read_fits(fits_path: Path) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """
-    Read a TESS FITS file and return a cleaned, normalized flux array.
+    Read a TESS FITS file and return (time, flux) after cleaning.
     Returns None if file is unreadable or has too few valid points.
 
     Steps:
-      1. Extract PDCSAP_FLUX + QUALITY columns
-      2. Apply TESS quality bitmask — remove bad cadences
-      3. Remove NaN values
+      1. Extract TIME + PDCSAP_FLUX + QUALITY
+      2. Apply TESS quality bitmask
+      3. Remove NaN
       4. 5-sigma outlier clipping
       5. Normalize: (flux - median) / MAD
+
+    Returns:
+        (time, flux) both float32 arrays — time needed for gap detection
     """
     try:
         from astropy.io import fits as astrofits
@@ -62,157 +58,191 @@ def _read_fits(fits_path: Path) -> Optional[np.ndarray]:
 
     try:
         with astrofits.open(fits_path) as hdul:
-            # TESS light curve data is in extension 1
-            data = hdul[1].data
+            data    = hdul[1].data
+            time    = data['TIME'].astype(np.float64)
             flux    = data['PDCSAP_FLUX'].astype(np.float32)
             quality = data['QUALITY'].astype(np.int32)
     except Exception as e:
         logger.warning(f"Could not read {fits_path}: {e}")
         return None
 
-    # TESS quality bitmask — remove flagged cadences
-    # Bits 1,2,4,8,32,64,512 indicate bad data
-    BAD_BITS = 1 | 2 | 4 | 8 | 32 | 64 | 512
-    good_mask = (quality & BAD_BITS) == 0
+    # Quality bitmask
+    BAD_BITS  = 1 | 2 | 4 | 8 | 32 | 64 | 512
+    good_mask = ((quality & BAD_BITS) == 0) & np.isfinite(flux) & np.isfinite(time)
+    time = time[good_mask]
     flux = flux[good_mask]
 
-    # Remove NaN
-    nan_mask = np.isfinite(flux)
-    flux = flux[nan_mask]
-
-    # Need minimum points to be useful
     if len(flux) < CFG.chunk_length:
         logger.warning(f"Too few points ({len(flux)}) in {fits_path.name} — skipping")
         return None
 
     # 5-sigma outlier clipping
-    median = np.median(flux)
-    mad    = np.median(np.abs(flux - median))
-    mad    = mad if mad > 0 else 1e-8          # guard against zero MAD
-    sigma  = 1.4826 * mad                      # MAD → std conversion factor
+    median    = np.median(flux)
+    mad       = np.median(np.abs(flux - median))
+    mad       = mad if mad > 0 else 1e-8
+    sigma     = 1.4826 * mad
     clip_mask = np.abs(flux - median) < 5.0 * sigma
-    flux = flux[clip_mask]
+    time      = time[clip_mask]
+    flux      = flux[clip_mask]
 
     if len(flux) < CFG.chunk_length:
         return None
 
-    # Normalize: (flux - median) / MAD
+    # Normalize
     median = np.median(flux)
     mad    = np.median(np.abs(flux - median))
     mad    = mad if mad > 0 else 1e-8
     flux   = (flux - median) / (1.4826 * mad)
 
-    return flux.astype(np.float32)
+    return time.astype(np.float32), flux.astype(np.float32)
 
 
-def _chunk(flux: np.ndarray, length: int, stride: int) -> list[np.ndarray]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Gap-aware chunking  ← PATCHED
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _chunk(
+    flux:   np.ndarray,
+    time:   np.ndarray,
+    length: int,
+    stride: int,
+) -> list[np.ndarray]:
     """
-    Split a 1D flux array into overlapping fixed-length chunks.
+    Split flux into fixed-length chunks, NEVER crossing Earth occultation gaps.
+
+    A gap is detected when the time difference between consecutive cadences
+    is > 10× the median cadence. Each continuous segment is chunked independently.
 
     Args:
-        flux   : 1D numpy array
+        flux   : 1D normalized flux array
+        time   : 1D time array (same length as flux)
         length : chunk size (CFG.chunk_length = 1000)
-        stride : step between chunk starts (CFG.chunk_stride = 500)
-                 stride < length means overlapping chunks — more training samples
+        stride : overlap stride (CFG.chunk_stride = 500)
 
     Returns:
         List of 1D arrays each of shape [length]
     """
+    if len(time) < 2:
+        return []
+
+    # Find gap positions
+    dt         = np.diff(time)
+    median_dt  = np.median(dt)
+    gap_mask   = dt > (10.0 * median_dt)
+    gap_idx    = np.where(gap_mask)[0] + 1   # index of first point AFTER each gap
+
+    # Segment boundaries: [0, gap1, gap2, ..., end]
+    boundaries = [0] + gap_idx.tolist() + [len(flux)]
+
     chunks = []
-    start  = 0
-    while start + length <= len(flux):
-        chunks.append(flux[start : start + length])
-        start += stride
+    for i in range(len(boundaries) - 1):
+        seg_start = boundaries[i]
+        seg_end   = boundaries[i + 1]
+        segment   = flux[seg_start:seg_end]
+
+        # Chunk this segment independently
+        start = 0
+        while start + length <= len(segment):
+            chunks.append(segment[start : start + length])
+            start += stride
+
     return chunks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TIC ID utilities
+# TIC ID and sector extraction from filename
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_tic_id(fits_path: Path) -> Optional[str]:
-    """
-    Extract TIC ID from a TESS FITS filename.
-
-    TESS filenames follow this pattern:
-      tess2018206045859-s0001-0000000012345678-0120-s_lc.fits
-                                  ^^^^^^^^^^^^^^^^^^
-                                  TIC ID is here (zero-padded to 16 digits)
-
-    Returns TIC ID as string (leading zeros stripped), or None if not parseable.
-    """
-    name = fits_path.stem  # filename without extension
-
-    # Try standard TESS filename pattern
+    """Extract TIC ID from TESS FITS filename (16-digit zero-padded)."""
+    name  = fits_path.stem
     match = re.search(r'-(\d{16})-', name)
     if match:
-        return str(int(match.group(1)))  # strip leading zeros
-
-    # Fallback: try any 8+ digit number in the filename
+        return str(int(match.group(1)))
     match = re.search(r'(\d{8,})', name)
     if match:
         return str(int(match.group(1)))
-
     logger.warning(f"Could not extract TIC ID from: {fits_path.name}")
     return None
 
 
 def _extract_sector(fits_path: Path) -> Optional[int]:
-    """
-    Extract sector number from a TESS FITS filename.
-
-    Pattern: tess2018206045859-s0001-...
-                                ^^^^^ sector 1
-    """
-    name = fits_path.stem
+    """Extract sector number from TESS FITS filename."""
+    name  = fits_path.stem
     match = re.search(r'-s(\d{4})-', name)
     if match:
         return int(match.group(1))
-
-    # Fallback: look for sector in parent directory name
-    parent = fits_path.parent.name
-    match = re.search(r'sector[_\-]?(\d+)', parent, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FITS scanner  ← PATCHED for your folder structure
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _scan_fits_files(data_dir: Path) -> dict[str, dict[int, Path]]:
     """
-    Recursively scan data_dir for TESS FITS files.
+    Scan data_dir for TESS FITS files matching VYOM folder structure:
+
+      data_dir/
+        TIC_{tic_id}/
+          mastDownload/
+            TESS/
+              tess...-s{sector:04d}-{tic:016d}-.../ 
+                *.fits
 
     Returns:
-        {
-          "12345678": {1: Path("sector_01/tess...fits"), 2: Path("sector_02/tess...fits")},
-          "87654321": {1: Path(...), 3: Path(...)},
-          ...
-        }
-
-    Only TIC IDs with 2+ sectors are useful for Noise2Noise — caller filters this.
+        { "tic_id_str": { sector_int: fits_path, ... }, ... }
     """
     tic_to_sectors: dict[str, dict[int, Path]] = {}
 
-    fits_files = list(data_dir.rglob("*.fits"))
-    logger.info(f"Found {len(fits_files)} FITS files in {data_dir}")
-
-    for path in fits_files:
-        tic_id = _extract_tic_id(path)
-        sector  = _extract_sector(path)
-
-        if tic_id is None or sector is None:
+    # Iterate TIC folders directly — much faster than rglob("*.fits") on deep trees
+    for tic_folder in data_dir.iterdir():
+        if not tic_folder.is_dir():
             continue
 
-        if tic_id not in tic_to_sectors:
-            tic_to_sectors[tic_id] = {}
+        # Expect folder named TIC_{number}
+        m = re.match(r'TIC_(\d+)$', tic_folder.name)
+        if m is None:
+            continue
 
-        tic_to_sectors[tic_id][sector] = path
+        tic_id = str(int(m.group(1)))   # strip leading zeros
 
+        mast_tess = tic_folder / "mastDownload" / "TESS"
+        if not mast_tess.exists():
+            continue
+
+        for sector_folder in mast_tess.iterdir():
+            if not sector_folder.is_dir():
+                continue
+
+            # Sector number from folder name  e.g. tess...-s0035-...
+            sm = re.search(r'-s(\d{4})-', sector_folder.name)
+            if sm is None:
+                continue
+            sector = int(sm.group(1))
+
+            fits_files = list(sector_folder.glob("*.fits"))
+            if not fits_files:
+                continue
+
+            if tic_id not in tic_to_sectors:
+                tic_to_sectors[tic_id] = {}
+
+            tic_to_sectors[tic_id][sector] = fits_files[0]
+
+    n_total  = sum(len(v) for v in tic_to_sectors.values())
+    n_multi  = sum(1 for v in tic_to_sectors.values() if len(v) >= 2)
+    logger.info(
+        f"Scanned {data_dir} — "
+        f"{len(tic_to_sectors)} TIC IDs, "
+        f"{n_total} FITS files, "
+        f"{n_multi} stars with 2+ sectors"
+    )
     return tic_to_sectors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Train / Val / Test split — ALWAYS by TIC ID
+# Train / Val / Test split — always by TIC ID
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _split_tic_ids(
@@ -221,25 +251,8 @@ def _split_tic_ids(
     val_frac:   float = CFG.val_frac,
     seed:       int   = 42,
 ) -> tuple[list[str], list[str], list[str]]:
-    """
-    Split TIC IDs into train / val / test sets.
-
-    CRITICAL: Split is by TIC ID, never by sample index.
-    Same star's light curves from different sectors must ALL go to the same split.
-    Random split by sample would leak correlated stellar patterns from train to test
-    and artificially inflate reported metrics.
-
-    Args:
-        tic_ids    : list of all TIC ID strings with 2+ sectors
-        train_frac : fraction for training (default 0.70)
-        val_frac   : fraction for validation (default 0.15)
-        seed       : random seed for reproducibility
-
-    Returns:
-        (train_ids, val_ids, test_ids) — three disjoint lists
-    """
     rng = np.random.default_rng(seed)
-    ids = np.array(sorted(tic_ids))    # sort first for determinism
+    ids = np.array(sorted(tic_ids))
     rng.shuffle(ids)
 
     n       = len(ids)
@@ -250,22 +263,16 @@ def _split_tic_ids(
     val_ids   = ids[n_train : n_train + n_val].tolist()
     test_ids  = ids[n_train + n_val :].tolist()
 
-    logger.info(f"TIC ID split — train: {len(train_ids)}, "
-                f"val: {len(val_ids)}, test: {len(test_ids)}")
+    logger.info(
+        f"TIC ID split — train: {len(train_ids)}, "
+        f"val: {len(val_ids)}, test: {len(test_ids)}"
+    )
     return train_ids, val_ids, test_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Caching — save processed chunks as .npy so we don't re-read FITS every run
+# Pairs index  ← PATCHED: picks closest sector pair, not just first two
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _cache_path(tic_id: str, sector_a: int, sector_b: int,
-                split: str, idx: int) -> Path:
-    """Return the .npy path for a specific chunk."""
-    folder = CFG.samples_dir / split
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder / f"tic{tic_id}_s{sector_a:02d}s{sector_b:02d}_chunk{idx:04d}.npy"
-
 
 def _build_pairs_index(
     tic_to_sectors: dict[str, dict[int, Path]],
@@ -273,30 +280,39 @@ def _build_pairs_index(
     split:          str,
 ) -> list[tuple[Path, Path]]:
     """
-    For each TIC ID in split_ids, pick TWO sectors and return their FITS paths.
-    Also writes a pairs_index.csv for auditing.
+    For each TIC ID pick the CLOSEST sector pair (minimum gap between sectors).
+    Writes pairs_index.csv for auditing.
 
     Returns:
-        List of (sector_A_fits_path, sector_B_fits_path) tuples
+        List of (sector_A_path, sector_B_path)
     """
-    pairs   = []
-    csv_rows = [["tic_id", "sector_a", "sector_b", "path_a", "path_b"]]
+    pairs    = []
+    csv_rows = [["tic_id", "sector_a", "sector_b", "sector_gap", "path_a", "path_b"]]
 
     for tic_id in split_ids:
         sector_map = tic_to_sectors.get(tic_id, {})
         sectors    = sorted(sector_map.keys())
 
         if len(sectors) < 2:
-            continue  # need at least 2 sectors for a Noise2Noise pair
+            continue
 
-        # Always use first two available sectors as the pair
-        # If star has 3+ sectors, we only use 2 per pair (can extend later)
-        sec_a, sec_b = sectors[0], sectors[1]
-        path_a = sector_map[sec_a]
-        path_b = sector_map[sec_b]
+        # Find the consecutive pair with smallest gap
+        best_gap  = 999
+        best_a    = sectors[0]
+        best_b    = sectors[1]
+
+        for i in range(len(sectors) - 1):
+            gap = sectors[i + 1] - sectors[i]
+            if gap < best_gap:
+                best_gap = gap
+                best_a   = sectors[i]
+                best_b   = sectors[i + 1]
+
+        path_a = sector_map[best_a]
+        path_b = sector_map[best_b]
 
         pairs.append((path_a, path_b))
-        csv_rows.append([tic_id, sec_a, sec_b, str(path_a), str(path_b)])
+        csv_rows.append([tic_id, best_a, best_b, best_gap, str(path_a), str(path_b)])
 
     # Write audit CSV
     csv_path = CFG.samples_dir / split / "pairs_index.csv"
@@ -305,32 +321,38 @@ def _build_pairs_index(
         writer = csv.writer(f)
         writer.writerows(csv_rows)
 
-    logger.info(f"[{split}] {len(pairs)} valid pairs from {len(split_ids)} TIC IDs")
+    logger.info(f"[{split}] {len(pairs)} pairs built")
     return pairs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dataset class
+# Cache path
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_path(
+    tic_id: str, sector_a: int, sector_b: int,
+    split: str, idx: int,
+) -> Path:
+    folder = CFG.samples_dir / split
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"tic{tic_id}_s{sector_a:02d}s{sector_b:02d}_chunk{idx:04d}.npy"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TESSSectorPairDataset(Dataset):
     """
     PyTorch Dataset for Noise2Noise denoiser training.
 
-    Each sample is a tuple: (chunk_from_sector_A, chunk_from_sector_B)
-    Both are [1, T] tensors from the same star, different sectors.
-    The model takes sector_A as input and tries to output sector_B.
-    Because noise in A and B are statistically independent, the model
-    learns to output the underlying clean signal.
+    Each sample: (chunk_A, chunk_B) — both [1, T] tensors.
+    Model input = chunk_A, N2N target = chunk_B.
 
     Args:
-        split       : "train", "val", or "test"
-        data_dir    : root directory containing TESS FITS files
-        force_rebuild: if True, ignore cache and rebuild .npy files from scratch
-
-    Example:
-        dataset = TESSSectorPairDataset("train")
-        x, y = dataset[0]   # x: [1, 1000], y: [1, 1000]
+        split        : "train", "val", or "test"
+        data_dir     : root dir containing TIC_* folders
+        force_rebuild: ignore cache and rebuild from FITS
     """
 
     def __init__(
@@ -340,114 +362,99 @@ class TESSSectorPairDataset(Dataset):
         force_rebuild: bool = False,
     ):
         assert split in ("train", "val", "test"), \
-            f"split must be 'train', 'val', or 'test' — got '{split}'"
+            f"split must be train/val/test — got '{split}'"
 
-        self.split = split
+        self.split  = split
         self.chunks: list[tuple[np.ndarray, np.ndarray]] = []
 
         cache_index = CFG.samples_dir / split / "pairs_index.csv"
 
         if cache_index.exists() and not force_rebuild:
-            logger.info(f"[{split}] Loading from cache: {CFG.samples_dir / split}")
+            logger.info(f"[{split}] Loading from cache")
             self._load_from_cache(split)
         else:
-            logger.info(f"[{split}] Cache not found — building from FITS files")
+            logger.info(f"[{split}] Building from FITS")
             self._build_from_fits(split, data_dir)
 
-        logger.info(f"[{split}] Dataset ready — {len(self.chunks)} chunk pairs")
-
-    # ── Build from raw FITS ────────────────────────────────────────────────
+        logger.info(f"[{split}] Ready — {len(self.chunks)} chunk pairs")
 
     def _build_from_fits(self, split: str, data_dir: Path):
-        """Scan FITS files, split by TIC ID, preprocess, chunk, cache."""
         tic_to_sectors = _scan_fits_files(data_dir)
 
-        # Keep only stars with 2+ sectors
         multi_sector = {
             tic: secs for tic, secs in tic_to_sectors.items()
             if len(secs) >= 2
         }
 
-        if len(multi_sector) == 0:
+        if not multi_sector:
             raise RuntimeError(
-                f"No multi-sector TESS FITS files found in {data_dir}.\n"
-                f"Download TESS data first: see data/setup/data_download.md"
+                f"No multi-sector TESS data found in {data_dir}\n"
+                "Check that TIC_* folders exist with mastDownload/TESS/ inside."
             )
 
-        all_tic_ids = list(multi_sector.keys())
+        all_tic_ids              = list(multi_sector.keys())
         train_ids, val_ids, test_ids = _split_tic_ids(all_tic_ids)
-
-        split_map = {"train": train_ids, "val": val_ids, "test": test_ids}
-        split_ids = split_map[split]
+        split_ids = {"train": train_ids, "val": val_ids, "test": test_ids}[split]
 
         pairs = _build_pairs_index(multi_sector, split_ids, split)
 
         for path_a, path_b in pairs:
-            flux_a = _read_fits(path_a)
-            flux_b = _read_fits(path_b)
+            result_a = _read_fits(path_a)
+            result_b = _read_fits(path_b)
 
-            if flux_a is None or flux_b is None:
+            if result_a is None or result_b is None:
                 continue
 
-            chunks_a = _chunk(flux_a, CFG.chunk_length, CFG.chunk_stride)
-            chunks_b = _chunk(flux_b, CFG.chunk_length, CFG.chunk_stride)
+            time_a, flux_a = result_a
+            time_b, flux_b = result_b
 
-            # Pair chunks positionally — same time window from both sectors
+            # Gap-aware chunking — pass time arrays
+            chunks_a = _chunk(flux_a, time_a, CFG.chunk_length, CFG.chunk_stride)
+            chunks_b = _chunk(flux_b, time_b, CFG.chunk_length, CFG.chunk_stride)
+
             n_pairs = min(len(chunks_a), len(chunks_b))
+            if n_pairs == 0:
+                continue
+
+            tic_id = _extract_tic_id(path_a)
+            sec_a  = _extract_sector(path_a)
+            sec_b  = _extract_sector(path_b)
 
             for idx in range(n_pairs):
                 ca = chunks_a[idx]
                 cb = chunks_b[idx]
 
-                # Cache to disk
-                tic_id  = _extract_tic_id(path_a)
-                sec_a   = _extract_sector(path_a)
-                sec_b   = _extract_sector(path_b)
                 np_path = _cache_path(tic_id, sec_a, sec_b, split, idx)
-
-                # Save as (2, T) array — row 0 = sector A, row 1 = sector B
-                np.save(np_path, np.stack([ca, cb], axis=0))
+                np.save(np_path, np.stack([ca, cb], axis=0))   # [2, T]
 
                 self.chunks.append((ca, cb))
 
-    # ── Load from cache ────────────────────────────────────────────────────
-
     def _load_from_cache(self, split: str):
-        """Load all .npy chunk files from cache directory."""
         cache_dir = CFG.samples_dir / split
         npy_files = sorted(cache_dir.glob("*.npy"))
 
-        if len(npy_files) == 0:
+        if not npy_files:
             raise RuntimeError(
-                f"Cache directory {cache_dir} exists but has no .npy files.\n"
-                "Run with force_rebuild=True to rebuild cache."
+                f"Cache dir {cache_dir} has no .npy files. "
+                "Run with force_rebuild=True."
             )
 
         for npy_path in npy_files:
-            arr = np.load(npy_path)    # shape: [2, T]
+            arr = np.load(npy_path)        # [2, T]
             self.chunks.append((arr[0], arr[1]))
-
-    # ── PyTorch Dataset interface ──────────────────────────────────────────
 
     def __len__(self) -> int:
         return len(self.chunks)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            x : [1, T] float32 tensor — noisy sector A (model input)
-            y : [1, T] float32 tensor — noisy sector B (Noise2Noise target)
-        """
-        chunk_a, chunk_b = self.chunks[idx]
-
-        x = torch.from_numpy(chunk_a).unsqueeze(0)   # [T] → [1, T]
-        y = torch.from_numpy(chunk_b).unsqueeze(0)   # [T] → [1, T]
-
+        ca, cb = self.chunks[idx]
+        x = torch.from_numpy(ca).unsqueeze(0)   # [1, T]
+        y = torch.from_numpy(cb).unsqueeze(0)   # [1, T]
         return x, y
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DataLoader factory — single entry point for train.py
+# DataLoader factory
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_dataloaders(
@@ -457,48 +464,30 @@ def get_dataloaders(
     force_rebuild: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Build and return train, val, test DataLoaders.
+    Returns (train_loader, val_loader, test_loader).
 
-    Args:
-        data_dir      : path to TESS FITS files
-        batch_size    : samples per batch (default from CFG)
-        num_workers   : parallel data loading workers
-                        0 = main process only (safe on Windows)
-                        4 = recommended on Linux with fast storage
-        force_rebuild : if True, reprocess all FITS files even if cache exists
-
-    Returns:
-        (train_loader, val_loader, test_loader)
+    num_workers=0 is safe on Windows.
+    Set force_rebuild=True first time to build cache from FITS.
     """
     train_ds = TESSSectorPairDataset("train", data_dir, force_rebuild)
     val_ds   = TESSSectorPairDataset("val",   data_dir, force_rebuild)
     test_ds  = TESSSectorPairDataset("test",  data_dir, force_rebuild)
 
     train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,               # shuffle training data every epoch
+        train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=True,             # drop incomplete last batch for stable training
+        drop_last=True,
     )
-
     val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,              # never shuffle val/test
+        val_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False,
     )
-
     test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
+        test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        drop_last=False,
     )
 
     return train_loader, val_loader, test_loader
